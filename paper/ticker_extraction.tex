@@ -1,0 +1,877 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+\usepackage{cite}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{url}
+\usepackage[hidelinks]{hyperref}
+
+\begin{document}
+
+\title{Ticker Extraction from Financial Influencer Videos}
+
+\author{\IEEEauthorblockN{Sri Veerabhadra Karthik Mulugu}
+\IEEEauthorblockA{\textit{Incoming Ph.D. Student, Computer Science} \\
+\textit{The University of Texas at San Antonio}\\
+San Antonio, TX, USA \\
+karthikmulugu14@gmail.com}}
+
+\maketitle
+
+\begin{abstract}
+The VideoConviction benchmark poses stock ticker extraction from financial
+influencer videos as a generation task: a model reads a transcript segment and
+emits a symbol. Before building an extractor I measured whether the symbol is
+present to be read, and found it absent from 47.9\% of annotated segments. The
+absence is not uniform. It concentrates on the largest companies: the symbol is
+spoken in 60.5\% of segments discussing sub-\$300M firms but only 28.1\% of
+those discussing firms above \$200B ($\rho=-0.215$, $p=1.5\times10^{-4}$). TSLA
+is annotated in 26 segments and the string ``TSLA'' occurs in none of them. A
+method that searches for the symbol is therefore not merely imperfect but
+systematically biased against the recommendations carrying the most capital. I
+reformulate the task as retrieval followed by ranking. A video-level stage
+harvests candidates from the description, title, full transcript, dense
+retrieval over company names, and optical character recognition of sampled
+frames, reducing a 10{,}550-symbol universe to a median of 93 candidates while
+retaining the correct answer 92.6\% of the time. A segment-level LambdaMART
+ranker then selects among them using 37 features. Evaluated out-of-fold with
+folds grouped by video and scores averaged over three random seeds, the system
+attains F1 80.06, exceeding every text-only model reported in the benchmark
+including Qwen2.5-72B at 79.20, while using no large language model and no paid
+inference. I report two implementation defects in full, because both were cases
+where a correction in one component opened a failure in another, and both were
+invisible in aggregate metrics.
+\end{abstract}
+
+\begin{IEEEkeywords}
+information extraction, learning to rank, multimodal retrieval, optical
+character recognition, financial NLP, selective prediction
+\end{IEEEkeywords}
+
+\section{Introduction}
+
+Financial influencers, colloquially ``finfluencers,'' publish stock
+recommendations to large audiences on video platforms. Studying their influence
+at scale requires first identifying automatically which stock each
+recommendation concerns.
+
+\subsection{What the Benchmark Provides}
+
+VideoConviction~\cite{videoconviction} supports this with more than 6{,}000
+expert annotations produced over 457 hours of human labelling. Each annotation
+marks a timestamped segment of a video containing exactly one recommendation,
+recording the ticker symbol, the recommended action, and a conviction score
+reflecting how strongly the presenter appears to believe the claim. The authors
+define three tasks of increasing difficulty: extracting the ticker (T), the
+ticker and action (TA), and the ticker, action and conviction (TAC). Task T is
+first, because the wrong symbol makes the action and conviction wrong
+too.
+
+\subsection{What the Benchmark Does}
+
+The authors evaluate 21 language and multimodal models on all three tasks. Their
+inference procedure is stated in a single sentence: a single prompt instructs
+the model to extract ticker, action and conviction simultaneously, zero-shot.
+No symbol registry is supplied, and the annotation field contains the correct
+ticker with no corresponding company name. Models therefore \emph{generate} a
+symbol from parametric knowledge.
+
+The strongest text-only system reaches F1 79.20 and the strongest multimodal
+system 86.23. The authors attribute the multimodal advantage to on-screen charts
+displaying ticker names, and separately observe that models emit plausible but
+non-existent symbols, giving \texttt{APPL} for Apple as their example.
+
+\subsection{What I Did Differently, and Why}
+
+Rather than start by building an extractor, I first measured whether the
+answer is in the input at all. Often it is not, and the pattern of what is
+missing shaped every choice that followed.
+
+\begin{enumerate}
+\item \textbf{A measurement that changes the task
+(Section~\ref{sec:char}).} The ticker symbol is absent from 47.9\% of segments,
+and absence correlates negatively with company size, so symbol matching fails
+hardest on the economically largest recommendations. I quantify this with a rank
+correlation, a bootstrap confidence interval and a non-parametric test.
+
+\item \textbf{Splitting the task into two stages
+(Sections~\ref{sec:rationale}--\ref{sec:rank}),} adopted because a simpler approach was
+measured and found worse, not by assumption. Each stage is measured separately, so the
+binding constraint on system performance is explicit and attributable.
+
+\item \textbf{Choosing from a list instead of generating (Section~\ref{sec:universe}).}
+Choosing from a constructed 10{,}550-symbol registry eliminates the
+hallucination failure the benchmark names, by construction rather than by
+prompting. It also removes the requirement that a model have memorised the
+symbol of a company delisted years ago, which matters because roughly a quarter
+of the correct answers are in that category.
+
+\item \textbf{A cheap way to use the video
+(Section~\ref{sec:ocr}).} If the multimodal advantage arises because symbols are
+\emph{written} on screen, what is needed is reading text, not
+understanding images. Frame OCR recovers the symbol in 41.9\% of segments and
+lifts the system from F1 78.02 to 80.06.
+\end{enumerate}
+
+I additionally report two defects found during development
+(Sections~\ref{sec:idfbug} and~\ref{sec:compound}). I include them because the
+first failed on precisely the population my own analysis had identified as
+critical, and because neither was visible in an aggregate score.
+
+\section{Data and Preprocessing}
+
+\subsection{Structure}
+
+Each row of VideoConviction corresponds to one segment of one video concerning
+one stock; a video covering five stocks yields five rows. The fields I use are
+the segment transcript, the full video transcript, the video title and
+description, the segment start and end timestamps, and the source URL.
+
+Transcripts are produced by automatic speech recognition (ASR). This is
+consequential throughout: company names are routinely corrupted, and
+orthographic conventions do not survive transcription.
+
+\subsection{Filtering}
+
+Of 760 annotated rows, 687 carry \texttt{is\_rec\_present = Yes}. The remaining
+73 are segments in which a stock is discussed but no recommendation is made.
+Since Task T asks which stock is being \emph{recommended}, these have no target,
+and I exclude them. All results below are over the 687. No segment in that set
+has an empty transcript, so no further filtering is applied.
+
+\subsection{Metric}
+
+I report F1 against the human annotations, following the benchmark. I
+additionally report coverage and precision separately, because a system
+permitted to decline is more useful downstream than one forced to commit, and
+that distinction is invisible in a single F1 figure.
+
+\section{Characterising the Task}
+\label{sec:char}
+
+\subsection{Is the Answer Present?}
+
+For each of the 687 segments I asked whether the correct symbol occurs in the
+transcript in any surface form. I tested three, chosen by reading transcripts
+rather than taken from prior work: a bare token (\texttt{MITK}), a cashtag
+(\texttt{\$MITK}), and a dictated spelling (\texttt{M-I-T-K}), the last being
+common when a presenter reads out an unfamiliar symbol.
+
+\begin{table}[htbp]
+\caption{Surface realisation of the correct ticker in the segment transcript
+($n = 687$). Forms are not mutually exclusive.}
+\label{tab:surface}
+\centering
+\begin{tabular}{lrr}
+\toprule
+Surface form & Segments & Share \\
+\midrule
+Cashtag \texttt{\$TICK} & 0 & 0.0\% \\
+Bare token \texttt{TICK} & 333 & 48.5\% \\
+Dictated \texttt{T-I-C-K} & 38 & 5.5\% \\
+\midrule
+Any literal form & 358 & 52.1\% \\
+\textbf{No literal form} & \textbf{329} & \textbf{47.9\%} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Two observations follow from Table~\ref{tab:surface}.
+
+First, no cashtag occurs in any transcript. The \texttt{\$TICK} convention is
+the standard marker in financial social-media text and I expected it to be the
+primary signal. It is orthographic, never spoken, and therefore never produced
+by ASR. I note the zero explicitly because anyone importing methods from
+StockTwits or Twitter corpora will build on a convention that does not survive
+this medium. The convention does appear in the \emph{typed} fields, 37 times in
+descriptions and 7 in titles, which is consistent with the same explanation.
+
+Second, and more consequentially, nearly half of all segments contain no form of
+the target string. For those segments the answer is not in the input, and no
+improvement in matching can recover it.
+
+\subsection{Absence Is Not Random}
+\label{sec:inversion}
+
+I then asked whether the 329 segments lacking a symbol differ systematically
+from those containing one. Binning by the market capitalisation of the correct
+ticker yields Table~\ref{tab:cap}.
+
+\begin{table}[htbp]
+\caption{Symbol visibility by market capitalisation}
+\label{tab:cap}
+\centering
+\begin{tabular}{lrr}
+\toprule
+Capitalisation band & Segments & Symbol spoken \\
+\midrule
+$<$ \$300M & 38 & 60.5\% \\
+\$300M--\$2B & 40 & 55.0\% \\
+\$2B--\$10B & 76 & 64.5\% \\
+\$10B--\$200B & 211 & 60.7\% \\
+$>$ \$200B & 167 & \textbf{28.1\%} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+I tested the pattern three ways rather than reporting the table as a trend,
+and chose each test for a reason.
+
+\emph{Spearman's rank correlation} ($\rho = -0.215$, $p = 1.5\times10^{-4}$,
+$n = 307$ tickers) asks whether two quantities move together using their rank
+order rather than their raw values. Rank order is right here because market
+capitalisation spans five orders of magnitude, so one trillion-dollar company
+would dominate an ordinary correlation. It is computed per ticker, not per
+segment, so a single heavily covered stock cannot drive the result.
+
+\emph{A bootstrap confidence interval} on the gap between the bottom and top
+capitalisation terciles gives $19.4$ points, 95\% interval $[7.1, 31.4]$. It is
+obtained by drawing 5{,}000 resamples of each group with replacement,
+recomputing the gap each time, and reading the middle 95\% of those values. It
+asks how far the answer would move on a different sample of the same size, and
+the interval excluding zero rules out the effect being an artefact of which
+companies happen to appear here.
+
+\emph{A one-sided Mann--Whitney test} ($p = 5.1\times10^{-4}$) checks the same
+comparison without assuming the data is normally distributed. Visibility per
+ticker is bounded in $[0,1]$ and clusters at the endpoints, so a $t$-test would
+not be appropriate.
+
+The relationship is better described as a threshold than a gradient. Visibility
+is approximately flat between 55\% and 67\% across four bands and collapses only
+in the mega-capitalisation band. The explanation is simple: a speaker says the symbol
+when the audience cannot be assumed to know the company, and that changes
+sharply at the point of household recognition rather than smoothly with size.
+
+The individual cases are stark. TSLA is annotated in 26 segments and the string
+``TSLA'' appears in none of them; AAPL in 10, likewise none. Conversely a
+\$225M firm has its symbol dictated character by character: \emph{``Veritone
+Inc., ticker V-E-R-I.''}
+
+Because capitalisation figures are present-day while the videos span 2019--2023,
+companies that have since delisted are excluded from this analysis (155 of 687
+segments). Delisted firms are disproportionately small, so their exclusion
+removes cases that would strengthen the correlation. The measured effect is
+conservative.
+
+\subsection{Why This Determines the Architecture}
+
+The problem is not just that symbol matching misses cases. It is that it
+misses them in a pattern. A system built on matching the symbol
+string performs worst on precisely the recommendations with the largest market
+impact, and an aggregate score conceals this. I therefore treat the symbol as
+one evidence source among several rather than as the object of extraction.
+
+\section{Design Rationale}
+\label{sec:rationale}
+
+\subsection{A Test That Made Things Worse}
+
+Given that the symbol is often absent from the segment, the natural remedy is to
+supply more text. The dataset includes each video's description, in which I
+measured the correct symbol to appear 35.1\% of the time. Supplying it to a flat
+extractor produced Table~\ref{tab:negresult}.
+
+\begin{table}[htbp]
+\caption{Effect of adding the video description to a flat extractor}
+\label{tab:negresult}
+\centering
+\begin{tabular}{lrrr}
+\toprule
+Input & Coverage & Precision & Recall \\
+\midrule
+Segment transcript only & 61.7\% & \textbf{71.2\%} & 44.0\% \\
++ video description & 86.5\% & \textbf{51.0\%} & 44.1\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Recall moved by 0.1 points while precision fell by 20. Supplying additional
+genuinely relevant information made the system substantially worse.
+
+\subsection{Diagnosis}
+
+Inspecting the induced errors explains it. A finfluencer's description
+enumerates every stock covered by the video, typically as a timestamped index.
+The field therefore identifies the candidate set for the \emph{video} and
+carries no information about which candidate a given \emph{segment} concerns.
+The flat extractor was selecting the first symbol it encountered, usually a
+different stock from the same video.
+
+The description is not a feature. It is a candidate list.
+
+\subsection{The Resulting Decomposition}
+
+That generalises. A signal that narrows the field without choosing between the
+options belongs in a retrieval stage, not in a scoring function. I therefore decompose Task T into a video-level stage that
+must not omit the answer and a segment-level stage that must not guess. This
+retrieve-and-rank pattern is standard in document ranking, where an inexpensive
+high-recall pass precedes an expensive precise one~\cite{luan}; its
+applicability here follows from how these videos are structured rather than
+from convention.
+
+\section{Stage 1: Candidate Generation}
+
+\subsection{Constructing a Candidate Universe}
+\label{sec:universe}
+
+The benchmark supplies no symbol registry, so I built one.
+
+This is a substantive design difference rather than plumbing. The evaluated
+systems generate a symbol from parametric knowledge, which is the direct cause
+of the failure the benchmark names: a generated string such as \texttt{APPL} is
+not checked against anything. Selecting from a registry removes that failure by
+construction, since an absent symbol cannot be emitted.
+
+A second consequence matters more here. A generative model must have memorised
+that Zynex trades as \texttt{ZYXI}. A selective model need only recognise that
+the segment concerns Zynex, because the symbol lookup happens deterministically
+upstream. Approximately 24\% of the correct answers belong to companies delisted
+before or shortly after the evaluated models' training cutoffs, where that
+memorisation is least likely to be present.
+
+I assembled the registry from three sources, in order of authority.
+
+\emph{The SEC.} The Securities and Exchange Commission publishes
+\texttt{company\_tickers.json}, listing every currently registered company:
+10{,}434 symbols, authoritative and free. It covers 301 of the 441
+correct answers.
+
+\emph{yfinance.} The SEC file is \emph{current}, and the videos span
+2019--2023. Companies acquired, renamed or bankrupted since are absent: Twitter,
+Slack, Xilinx, FireEye, Activision Blizzard. I queried Yahoo Finance for each of the
+140 correct symbols the SEC file missed, because its coverage is historical
+rather than current. It resolved 34 of them.
+
+\emph{Manual entry.} The remaining 106 were resolved by hand where a name
+could be established at all, which it could for 82. The count is not a budget I
+chose; it is what was left after the two automatic sources, and every one of
+them is a correct answer the system could otherwise never retrieve by name.
+
+The resulting registry has 10{,}550 entries. Candidates are always drawn from
+all of it, never from the 441 symbols that are correct answers; restricting the
+candidate set to the label set would inflate precision by a large and
+uninterpretable margin.
+
+Twenty-four of the 441 correct answers resolve to no name from any source and
+are left blank rather than guessed, since a wrong name would actively steer the
+matcher toward the wrong company. Four are not symbols at all but annotation
+errors; the remainder are delisted over-the-counter and foreign shells. Those
+segments can therefore only be reached through the symbol itself, and they
+account for part of the gap between stage-1 recall and 100\%.
+
+\subsection{Evidence Sources}
+
+For each video I pool evidence from the segment transcript, the full transcript,
+the title and the description. The detection rules, listed in Table~\ref{tab:rules}, were written by
+inspecting transcripts; none is taken from the benchmark, which describes no
+detection procedure.
+
+\begin{table}[htbp]
+\caption{Detection rules and how often each fires}
+\label{tab:rules}
+\centering
+\begin{tabular}{lr}
+\toprule
+Rule & Fires on \\
+\midrule
+Cue phrase (``ticker VERI'', ``trades under'') & 34.4\% of segments \\
+Dictated spelling \texttt{V-E-R-I} & 5.4\% \\
+Cashtag \texttt{\$VERI} & 0\% spoken, 44 typed \\
+Bare capitalised token in registry & frequent, low precision \\
+Company name via inverted index & --- \\
+Dense retrieval over name embeddings & --- \\
+Symbol read by frame OCR & 41.9\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Bare capitalised tokens are filtered against a list of symbols that are also
+ordinary English words (\texttt{ALL}, \texttt{NOW}, \texttt{WELL}), without
+which the rule produces almost only false positives. Measured in isolation, the
+cue-phrase rule combined with a dictated spelling is the most precise at 96.6\%,
+while the bare-token rule reaches only 50.5\%.
+
+\subsection{Weighting Name Evidence}
+
+Name matching requires a notion of how much a given word constrains the identity
+of a company. I use inverse document frequency (IDF) over two distinct reference
+collections, because either alone is insufficient.
+
+\emph{Gazetteer IDF} measures how few company names contain a token. It
+correctly assigns zero weight to \emph{Holdings} and high weight to
+\emph{Veritone}. It cannot distinguish a distinctive proper noun from an
+ordinary English word that happens to be rare in company names, so it rates
+\emph{Next} and \emph{Today} highly. An early version of this system
+consequently matched the word ``today'' to a company.
+
+\emph{Corpus IDF} measures how few \emph{transcripts} contain a token, learned
+from the dataset itself. This suppresses ordinary vocabulary without any
+hand-authored stoplist, which matters because a stoplist I wrote would encode
+my assumptions about what is ordinary rather than measure it.
+
+Both are computed as $\log(N / n_t)$, where $N$ is the number of documents in
+the reference collection and $n_t$ the number containing token $t$. For
+gazetteer IDF the documents are the 10{,}550 company names; for corpus IDF they
+are the 687 transcripts. The two are multiplied, so a token must be rare in both
+senses to carry weight: distinctive as a company name \emph{and} unusual in
+finance speech.
+
+\begin{table}[htbp]
+\caption{The two IDFs and their product on representative tokens}
+\label{tab:idf}
+\centering
+\begin{tabular}{lrrr}
+\toprule
+Token & Gazetteer IDF & Corpus weight & Product \\
+\midrule
+veritone & 9.26 & 1.00 & 9.26 \\
+skin & 9.26 & 0.78 & 7.20 \\
+\textbf{tesla} & \textbf{9.26} & \textbf{0.28} & \textbf{2.56} \\
+today & 8.57 & 0.18 & 1.52 \\
+holdings & 0.00 & 0.53 & 0.00 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Defect 1: Corpus-IDF Suppression of Large Caps}
+\label{sec:idfbug}
+
+The \emph{tesla} row of Table~\ref{tab:idf} is the defect. Its gazetteer IDF
+equals that of \emph{veritone}, but its corpus weight is 0.28 because Tesla is
+discussed in a large fraction of transcripts. The product collapses.
+
+I had applied the product at both stages. At the retrieval stage this removed
+TSLA (17 segments), AAPL (7), NVDA (6) and AMZN (6) from the candidate pool
+entirely, before any ranking occurred.
+
+The structure of the error is worth stating plainly. Corpus IDF is a frequency
+penalty; the most frequently discussed companies are the mega caps; and the mega
+caps are precisely the population identified in Section~\ref{sec:inversion} as
+the one where the symbol is least often spoken and name evidence therefore most
+needed. A correction I introduced for precision had opened a recall failure in
+the exact population my own analysis had flagged as critical.
+
+The remedy follows from the stage objectives: since stage 1 optimises recall, it
+uses gazetteer IDF alone, and only the feature representation uses the product.
+Stage-1 recall rose from 81.8\% to 88.2\%.
+
+This was invisible in aggregate recall, which moved by a few points and could
+plausibly have been accepted. I found it by listing which tickers were being
+missed and recognising the names.
+
+\subsection{Defect 2: Compound-Name Fragmentation}
+\label{sec:compound}
+
+ASR renders CamelCase company names as separate words: CrowdStrike as ``Crowd
+Strike'', SoFi as ``So Fi'', DraftKings as ``Draft Kings''. The fragments are
+ordinary vocabulary, match nothing, and the company disappears from the pool.
+Concatenating adjacent capitalised tokens and testing the result recovers these
+cases, raising recall from 88.2\% to 88.9\%.
+
+This is the same class of ASR damage as the phonetic corruption of ``Mitek''
+into ``Midic'', differing only in that the error is a boundary error rather than
+a substitution.
+
+\subsection{Resulting Recall}
+
+Adding dense retrieval over company-name embeddings and OCR symbols gives
+\textbf{92.6\%} stage-1 recall, at a median of 93 and mean of 147 candidates per
+segment. This figure is the hard ceiling on system performance and I report it
+first in all subsequent analysis.
+
+\section{Stage 2: Learned Ranking}
+\label{sec:rank}
+
+\subsection{Why Ranking, and Why Learned}
+
+Since the correct symbol is in the pool 92.6\% of the time, segment attribution is
+a ranking problem over a small set, not a generation problem over a large
+vocabulary.
+
+My initial scorer assigned weights by hand: 3.0 for symbol presence, 4.0 for
+cue-phrase adjacency, and so on. It achieved recall@1 of 58.6\% against
+recall@5 of 82.2\%. That gap is the diagnosis. The evidence was enough to put
+the answer in the top five four times out of five, and the numbers I had chosen
+were failing to put it first.
+
+\begin{table}[htbp]
+\caption{Hand-weighted scores for the Veritone segment. Correct answer is VERI.}
+\label{tab:veri}
+\centering
+\begin{tabular}{rll}
+\toprule
+Score & Symbol & Company \\
+\midrule
+\textbf{12.30} & \textbf{VERI} & Veritone, Inc. \\
+11.30 & V & Visa Inc. \\
+4.80 & NATNF & Nation Gold Corp. \\
+4.80 & LYV & Live Nation Entertainment \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:veri} shows a representative near-failure. Visa is almost
+selected, because the dictated spelling \texttt{V-E-R-I} contains the token
+\texttt{V}, which is Visa's symbol, and the cue phrase ``ticker'' immediately
+precedes it. Every rule that fires for VERI also fires for V. Telling them apart
+needs the pieces of evidence weighed together, which fixed numbers chosen by
+hand cannot do. The margin is 1.0 point.
+
+With 687 labelled segments available, these weights are better estimated than
+assumed.
+
+\subsection{Feature Representation}
+
+Each segment is treated as a query and its candidate pool as the ranked list,
+giving 100{,}867 (segment, candidate) pairs over 37 features in six groups.
+
+\emph{Symbol evidence}: presence, occurrence count, dictated form, cashtag,
+cue-phrase adjacency, and normalised position of first mention. Position is
+included because these segments announce the stock early; a mention in the final
+fifth is usually a comparison rather than the subject.
+
+\emph{Name evidence}: IDF-weighted mass of matched name tokens, exact token
+count, coverage fraction, best fuzzy ratio, position of first mention.
+
+\emph{Dense evidence}: cosine similarity and within-list rank between the
+segment embedding and the company-name embedding, both from a MiniLM sentence
+encoder~\cite{minilm}.
+
+\emph{Provenance}: which stage-1 source contributed the candidate, and how many
+did.
+
+\emph{Structural alignment}: the segment's ordinal position within its video,
+the candidate's first-mention position in the description and full transcript,
+and the absolute difference between them. These videos are predominantly
+countdown formats, so the $n$th segment typically concerns the $n$th enumerated
+stock. No property of the segment's content encodes this.
+
+\emph{Visual evidence}: Section~\ref{sec:ocr}.
+
+\subsection{Model and Training}
+
+I fit LambdaMART~\cite{lambdamart} using the LightGBM implementation.
+
+A ranker is used rather than a classifier on purpose. A classifier asks whether
+each candidate is correct on its own, which is the wrong question. The question
+that matters is whether VERI is placed above V, and LambdaMART optimises that
+ordering directly.
+
+Training configuration: 900 boosting iterations, learning rate 0.03, 63 leaves,
+minimum 15 samples per leaf, row and feature subsampling at 0.85, $L_2$
+regularisation 1.0. Labels are binary, one relevant document per query. Each
+fold is fitted three times under different random seeds and the predicted scores
+averaged before selection.
+
+I note one practical constraint discovered while testing a single-stage variant:
+LightGBM rejects any query containing more than 10{,}000 documents. Ranking the
+full registry per segment is therefore not expressible in this implementation
+without truncation, independent of its cost.
+
+\section{Visual Evidence}
+\label{sec:ocr}
+
+\subsection{Motivation}
+
+The benchmark attributes the multimodal advantage on Task T specifically to
+on-screen charts displaying ticker names. If that is the operative mechanism,
+what is needed is reading text, not understanding images, and reading text is
+far cheaper.
+
+The hypothesis is directly testable: if symbols are written on screen, OCR of
+sampled frames should recover them, and should do so disproportionately in
+segments where the symbol is never spoken.
+
+\subsection{Acquisition}
+
+The dataset distributes source URLs rather than frames, so frames must be
+fetched. I resolve a direct stream URL per video and extract six evenly spaced
+JPEG frames per segment using HTTP range requests, so no video is downloaded in
+full.
+
+\subsection{Extraction}
+
+Frames are processed with a GPU OCR model. I treat two patterns as strong
+evidence because they are chart-header conventions rather than incidental text:
+parenthesised symbols, \texttt{(VERI)}, and exchange-prefixed symbols,
+\texttt{NASDAQ: VERI}. In practice the dominant source is a screen-recorded
+financial quote page whose header reads, for example, \emph{``Veritone, Inc.
+(VERI)''}.
+
+Frames also contain substantial irrelevant text: bookshelves, wall decorations,
+unrelated captions. This stage therefore makes no selection. It emits evidence
+annotated with a confidence and a pattern type, which the ranker weighs against
+everything else.
+
+\begin{table}[htbp]
+\caption{Visual evidence coverage}
+\label{tab:ocr}
+\centering
+\begin{tabular}{lr}
+\toprule
+Quantity & Value \\
+\midrule
+Videos retrieved & 158 / 215 \\
+Videos unavailable (deleted or private) & 57 (26.5\%) \\
+Frames extracted & 2{,}628 \\
+Segments with any frame & 438 / 687 (63.8\%) \\
+\textbf{Correct symbol readable on screen} & \textbf{288 / 687 (41.9\%)} \\
+\quad matching a chart-header pattern & 97 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Result}
+
+The 41.9\% in Table~\ref{tab:ocr} is computed over all 687 segments, including
+the 36.2\% for which no frame could be obtained; among segments with frames it
+is 65.8\%.
+
+For comparison the transcript contains the symbol in some literal form in
+52.1\% of segments. The two
+channels are thus comparably informative and, critically, informative in
+\emph{different} segments: the screen continues to display \texttt{VERI} where
+the presenter says only ``Veritone''. It is that difference, not the raw coverage, that makes the
+video worth collecting.
+
+\section{Experimental Protocol}
+
+\subsection{Grouped Cross-Validation}
+
+I use five-fold cross-validation with folds partitioned by \texttt{video\_id}
+via \texttt{GroupKFold}. Five folds split 215 videos into test sets of roughly
+43, large enough to hold a representative mix of video formats while still
+leaving 80\% of the data for fitting. The grouping matters. Segments from a
+common video share a candidate pool, a description, a title and a full
+transcript; a
+random partition would place near-duplicates on both sides and the resulting
+estimate would be optimistic by an unknown margin. Under grouping no video
+appears in both training and test. All reported figures are out-of-fold.
+
+\subsection{Seed Averaging}
+
+LightGBM subsamples rows and features stochastically, so a single seed yields a
+non-deterministic estimate. On 687 queries I observe approximately one point of
+F1 variation across seeds; one configuration scored 78.31 on a single seed and
+78.02 averaged over three. Since the margins separating adjacent published
+systems are of comparable size, a single-seed result cannot distinguish a
+genuine improvement from sampling noise. All reported scores are averaged over
+three seeds. Three is a pragmatic choice: it reduces the spread enough that the
+remaining variation is well below the margins being claimed, at three times the
+training cost rather than ten.
+
+\section{Results}
+
+\begin{table}[htbp]
+\caption{Task T, segmented input. Published figures from~\cite{videoconviction},
+Table 6.}
+\label{tab:results}
+\centering
+\begin{tabular}{llr}
+\toprule
+System & Input & F1 \\
+\midrule
+Mistral-7B & text & 63.73 \\
+DeepSeek-R1 & text & 71.18 \\
+Gemini 1.5 Flash & text & 72.09 \\
+Claude 3.5 Sonnet & text & 75.90 \\
+Gemini 1.5 Pro & text & 76.56 \\
+GPT-4o & text & 76.76 \\
+DeepSeek-V3 & text & 77.56 \\
+Llama-3.1-405B & text & 78.60 \\
+Qwen2.5-72B & text & 79.20 \\
+\midrule
+\textbf{This work} & \textbf{text + frame OCR} & \textbf{80.06} \\
+\midrule
+Gemini 2.0 Flash & text + video & 82.24 \\
+GPT-4o & text + video & 83.47 \\
+Gemini 1.5 Pro & text + video & 86.01 \\
+Gemini 1.5 Flash & text + video & 86.23 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+F1 80.06 exceeds all 16 text-only published results, including the strongest,
+while using no large language model, no API and a single consumer GPU. The five
+systems above it are all multimodal.
+
+\subsection{Decomposition}
+
+The score splits exactly into the two stages:
+\begin{equation*}
+  \mathrm{F1} \;=\; R_{1} \times A_{2} \;=\; 0.926 \times 0.865 \;=\; 0.801
+\end{equation*}
+
+where $R_{1}$ is stage-1 recall, the share of segments whose correct ticker
+reached the candidate pool, and $A_{2}$ is ranker accuracy, the share of those
+the ranker then placed first.
+
+This holds exactly, not approximately. The system can only answer with a
+candidate stage 1 produced, so a segment whose answer never entered the pool is
+wrong no matter what the ranker does. Every segment receives exactly one answer
+and has exactly one correct one, so precision, recall and F1 coincide, and the
+fraction correct is the probability the answer reached the pool multiplied by
+the probability the ranker then chose it.
+Each term is independently improvable, and the factorisation says which to
+target. This is the principal practical advantage of the decomposition over an
+end-to-end method: an aggregate score does not distinguish failing to consider
+the answer from failing to select it.
+
+\subsection{Ablation}
+
+\begin{table}[htbp]
+\caption{Contribution of each component}
+\label{tab:ablation}
+\centering
+\begin{tabular}{lrr}
+\toprule
+Configuration & Stage-1 recall & F1 \\
+\midrule
+Flat lexical, segment only & --- & 54.4 \\
+Flat lexical + description & --- & 47.7 \\
+Two-stage, hand-weighted scorer & 88.9\% & 56.6 \\
+\quad + learned ranker & 88.6\% & \textbf{73.1} \\
+\quad + dense similarity feature & 88.6\% & 75.1 \\
+\quad + structural alignment & 88.6\% & 75.7 \\
+\quad + dense retrieval in stage 1 & 91.6\% & 78.0 \\
+\quad + frame OCR & \textbf{92.6\%} & \textbf{80.1} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:ablation} supports three observations. Adding the description
+to a flat extractor is actively harmful, as established in
+Section~\ref{sec:rationale}. The single largest gain,
+16.5 points, comes from replacing hand-chosen weights with a learned ranker
+rather than from any additional signal. Frame OCR contributes the final 2.0
+points and is the step that crosses the strongest text-only baseline.
+
+\subsection{Feature Importance}
+
+The two dense features rank highest by split count, followed by candidate-pool
+size and the stage-1 ordering. Lexical symbol features carry lower aggregate
+importance but are not redundant: they are decisive on the 52.1\% of segments
+where the symbol is present and silent elsewhere. The complementarity between
+lexical and dense evidence reported in document retrieval~\cite{luan} therefore
+reproduces here at the level of individual features.
+
+\subsection{Selective Prediction}
+
+A misidentified symbol is more damaging in any downstream analysis than a
+declined one. The ranker's margin, the score gap between its first and second
+candidate, provides an abstention signal requiring no additional model.
+
+\begin{table}[htbp]
+\caption{Selective prediction by ranking margin}
+\label{tab:abstain}
+\centering
+\begin{tabular}{lrr}
+\toprule
+Operating point & Coverage & Precision \\
+\midrule
+Answer all & 100.0\% & 80.06 \\
+Drop lowest 10\% by margin & 90.0\% & 86.25 \\
+Drop lowest 20\% & 79.9\% & 90.71 \\
+Drop lowest 30\% & 70.0\% & \textbf{93.76} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Precision rises steadily across the operating points in
+Table~\ref{tab:abstain}, which means the margin says something real about
+whether the answer is right, not just about how many candidates there were.
+
+\section{Limitations}
+
+\textbf{Comparability.} The published systems are evaluated zero-shot; mine is
+trained on VideoConviction under grouped cross-validation. The result is valid
+as a benchmark figure on this dataset and is not a claim about transfer to a
+different corpus. I state this prominently because Table~\ref{tab:results} would
+otherwise be misread.
+
+\textbf{Corpus attrition.} 26.5\% of source videos are no longer retrievable, so
+36.2\% of segments receive no visual evidence. The benchmark authors conducted
+their experiments when a larger fraction of the corpus was available, so their
+multimodal figures reflect fuller visual coverage than is now obtainable.
+
+The size of that effect can be estimated from the system's own predictions.
+Partitioning the 687 segments by whether any frame was retrieved gives F1
+$84.47$ on the 438 segments that still have video against $72.29$ on the 249
+that do not, a gap of $12.19$ points. The 438-segment figure is within two
+points of the strongest multimodal baseline, which had full video access. This
+is not a clean experiment. Segments whose video survives carry transcripts
+46\% longer on average, 2{,}342 characters against 1{,}605, which independently
+favours the text features, so the split is an upper bound on what restored
+coverage would recover rather than a prediction. A gap of this size is
+nonetheless difficult to attribute to method alone, and it places most of the
+distance between 80.06 and 86.23 on corpus attrition.
+
+\textbf{Partial visual signal.} The multimodal baselines process video. This
+system reads text from still frames and uses no motion, layout or chart
+geometry.
+
+\textbf{Single corpus.} As with any single-dataset result, the method cannot be
+fully separated from the properties this corpus rewards.
+
+\textbf{Label noise.} The answer key contains entries such as
+\texttt{"NYSE: AMZN"} and \texttt{"ADR"}, and approximately 24\% of the correct answers
+no longer trade.
+
+\section{Conclusion}
+
+Treating ticker extraction as a generation problem hides the fact that the
+answer is often missing from the input, and missing more often for bigger
+companies. Reformulating the task as retrieval followed by ranking makes the binding
+constraint explicit and separately measurable, and reading symbols from video
+frames with OCR captures a substantial part of the multimodal advantage at
+negligible cost. The resulting system exceeds every text-only published baseline
+without a large language model.
+
+Two directions follow directly from the decomposition. Stage-1 recall is limited
+chiefly by colloquial-versus-registered company names and by single-character
+symbols, suggesting alias resolution. Ranker accuracy is limited by a bi-encoder
+representation that scores segment and candidate independently, suggesting a
+cross-encoder.
+
+A third direction interests me more. Everything measured here concerns
+\emph{accidental} obfuscation: ASR corruption and the ordinary pragmatics of not
+naming a familiar company. A finfluencer subject to regulatory attention has a
+direct incentive to avoid automated attribution, which is the structure of an
+adversary rewriting content to evade a detector under a query budget. Whether
+any of the signals used here survive that setting is an open question, and not
+one the present evaluation addresses.
+
+\section*{Code and Data}
+
+The dataset is public. All preparation, analysis and evaluation code described
+here, together with the hand-built symbol registry, is available from the
+author. Every figure in this paper is produced by one of four scripts and
+written to a results file, so each number can be traced to the run that
+generated it.
+
+\begin{thebibliography}{9}
+
+\bibitem{videoconviction}
+M. Galarnyk, V. Kejriwal, A. Shah, Y. Bhardwaj, N. W. Meyer, A. Krishnan, and
+S. Chava, ``VideoConviction: A multimodal benchmark for human conviction and
+stock market recommendations,'' in \emph{Proc. ACM SIGKDD Conf. Knowledge
+Discovery and Data Mining (KDD)}, Toronto, ON, Canada, 2025.
+
+\bibitem{lambdamart}
+C. J. C. Burges, ``From RankNet to LambdaRank to LambdaMART: An overview,''
+Microsoft Research, Tech. Rep. MSR-TR-2010-82, 2010.
+
+\bibitem{luan}
+Y. Luan, J. Eisenstein, K. Toutanova, and M. Collins, ``Sparse, dense, and
+attentional representations for text retrieval,'' \emph{Trans. Assoc. Comput.
+Linguistics}, vol. 9, pp. 329--345, 2021.
+
+\bibitem{minilm}
+N. Reimers and I. Gurevych, ``Sentence-BERT: Sentence embeddings using Siamese
+BERT-networks,'' in \emph{Proc. EMNLP-IJCNLP}, Hong Kong, 2019, pp. 3982--3992.
+
+\end{thebibliography}
+
+\end{document}

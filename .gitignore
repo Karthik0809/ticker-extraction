@@ -1,0 +1,23 @@
+# Large regenerable data. src/1_prepare.py rebuilds the first three,
+# src/2_video.py the last two.
+data/*.parquet
+data/*.npy
+data/ocr_evidence.json
+data/frames/
+
+# LaTeX build products
+paper/*.aux
+paper/*.log
+paper/*.out
+
+# The explainer is distributed as EXPLAINED.pdf; the source stays in history.
+EXPLAINED.md
+
+__pycache__/
+*.pyc
+
+# Packaged code bundle, rebuilt on demand.
+ticker_extraction_code.zip
+
+# Experiment caches (rebuilt by experiments/a_rank_lists.py)
+experiments/out/*.pkl

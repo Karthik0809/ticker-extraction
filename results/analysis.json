@@ -1,0 +1,14 @@
+{
+  "n_segments": 687,
+  "no_symbol_anywhere": 329,
+  "no_symbol_share": 0.47889374090247455,
+  "spearman_rho": -0.21453411934976885,
+  "spearman_p": 0.00015198537639504893,
+  "tercile_diff": 0.19387997623291725,
+  "ci95": [
+    0.07018122400475348,
+    0.31497474747474746
+  ],
+  "mannwhitney_p": 0.0005062117432947927,
+  "verdict": "SUPPORTED"
+}
